@@ -21,25 +21,28 @@ let isPairingInProgress = false
 let latestQR = null
 let isFirstStart = true
 let selectedLoginMethod = "3"
-let isSocketReady = false
+let connectionState = "close" // close | connecting | open
 
 // ============================================
-//    WAIT FOR SOCKET READY HELPER
+//    WAIT FOR SOCKET WS CONNECTION
 // ============================================
-function waitForSocket(timeoutMs = 15000) {
+function waitForConnection(timeoutMs = 30000) {
     return new Promise((resolve, reject) => {
-        if (sockGlobal && isSocketReady) return resolve(sockGlobal)
+        // ── Already connected or connecting ──
+        if (sockGlobal && connectionState !== "close") {
+            return resolve(sockGlobal)
+        }
 
         const start = Date.now()
         const interval = setInterval(() => {
-            if (sockGlobal && isSocketReady) {
+            if (sockGlobal && connectionState !== "close") {
                 clearInterval(interval)
                 resolve(sockGlobal)
             } else if (Date.now() - start >= timeoutMs) {
                 clearInterval(interval)
-                reject(new Error("Socket not ready within timeout"))
+                reject(new Error("Timeout waiting for socket connection"))
             }
-        }, 500)
+        }, 300)
     })
 }
 
@@ -69,15 +72,16 @@ app.get('/pair', async (req, res) => {
             })
         }
 
-        // ── Wait for Socket (max 15s) ──
-        console.log("⏳ Waiting for socket to be ready...")
+        // ── Wait for WS Connection (max 30s) ──
+        console.log(`📡 /pair called → waiting for WS connection...`)
         let sock
         try {
-            sock = await waitForSocket(15000)
+            sock = await waitForConnection(30000)
         } catch (e) {
             return res.status(503).json({
                 status: false,
-                message: "❌ Bot socket not ready, please try again in a moment"
+                message: "❌ Bot not connected to WhatsApp servers yet, please try again in a few seconds",
+                hint: "Check /status to see connection state"
             })
         }
 
@@ -85,7 +89,15 @@ app.get('/pair', async (req, res) => {
         if (sock.authState.creds.registered) {
             return res.status(400).json({
                 status: false,
-                message: "❌ Device already paired, delete session to re-pair"
+                message: "❌ Device already paired. Delete session folder to re-pair."
+            })
+        }
+
+        // ── Already Connected (open) ──
+        if (connectionState === "open") {
+            return res.status(400).json({
+                status: false,
+                message: "❌ Bot is already connected and authenticated"
             })
         }
 
@@ -98,14 +110,14 @@ app.get('/pair', async (req, res) => {
         }
 
         isPairingInProgress = true
-        console.log(`📱 Pair Code Requested → ${cleanPhone}`)
+        console.log(`📱 Requesting pair code for: ${cleanPhone}`)
 
-        // ── Generate Pair Code ──
+        // ── Request Pair Code ──
         const code = await sock.requestPairingCode(cleanPhone)
         const formattedCode = code?.match(/.{1,4}/g)?.join("-") || code
 
         isPairingInProgress = false
-        console.log(`🔑 Pair Code: ${formattedCode}`)
+        console.log(`🔑 Pair Code Generated: ${formattedCode}`)
 
         return res.status(200).json({
             status: true,
@@ -133,13 +145,13 @@ app.get('/qr', (req, res) => {
     if (!latestQR) {
         return res.status(404).json({
             status: false,
-            message: "❌ No QR code available yet"
+            message: "❌ No QR code available yet, please wait..."
         })
     }
     return res.status(200).json({
         status: true,
         qr: latestQR,
-        message: "✅ QR Code ready to scan"
+        message: "✅ QR Code ready"
     })
 })
 
@@ -147,17 +159,18 @@ app.get('/qr', (req, res) => {
 //         STATUS API ENDPOINT
 // ============================================
 app.get('/status', (req, res) => {
-    const isConnected = sockGlobal?.user ? true : false
     return res.status(200).json({
         status: true,
-        connected: isConnected,
-        socketReady: isSocketReady,
+        connectionState: connectionState,
+        socketReady: sockGlobal !== null,
+        authenticated: sockGlobal?.authState?.creds?.registered || false,
         user: sockGlobal?.user || null,
-        message: isConnected
-            ? `✅ Connected as ${sockGlobal.user?.name}`
-            : isSocketReady
-                ? "⏳ Socket ready, not yet authenticated"
-                : "❌ Bot Not Connected"
+        message:
+            connectionState === "open"
+                ? `✅ Connected as ${sockGlobal?.user?.name}`
+                : connectionState === "connecting"
+                    ? "⏳ Connecting to WhatsApp servers..."
+                    : "❌ Disconnected"
     })
 })
 
@@ -184,7 +197,7 @@ async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState("session")
     const { version } = await fetchLatestBaileysVersion()
 
-    // ── Ask login method only ONCE on first start ──
+    // ── Ask login method only ONCE ──
     if (isFirstStart && !state.creds.registered) {
         console.log("╭───〘 👑 LOGIN METHOD 〙──────╮")
         console.log("│ 1. QR Code Scan              │")
@@ -203,49 +216,27 @@ async function startBot() {
         auth: state,
         printQRInTerminal: selectedLoginMethod === "1",
         logger: pino({ level: "silent" }),
-        browser: Browsers.macOS("Desktop")
+        browser: Browsers.macOS("Desktop"),
+        // ── Important: Keep alive ──
+        keepAliveIntervalMs: 10000,
+        connectTimeoutMs: 60000,
+        retryRequestDelayMs: 250
     })
 
-    // ── Mark socket ready immediately after creation ──
     sockGlobal = sock
-    isSocketReady = true
-    console.log("🟢 Socket initialized and ready")
-
-    // ── Terminal Pair Code Mode ──
-    if (!sock.authState.creds.registered && selectedLoginMethod === "2" && !isPairingInProgress) {
-        isPairingInProgress = true
-        try {
-            console.log("╭───〘 👑 PAIR CODE SYSTEM 〙───╮")
-            const phoneNumber = await askQuestion("│ 📱 Enter WhatsApp Number:\n│ Ex: 94758298744\n╰──────────────────────────────╯\n➛ ")
-            const code = await sock.requestPairingCode(phoneNumber.replace(/[^0-9]/g, ""))
-            const formattedCode = code?.match(/.{1,4}/g)?.join("-") || code
-            console.log(`╭───〘 ✅ YOUR PAIR CODE 〙───╮`)
-            console.log(`│       ${formattedCode}       │`)
-            console.log(`╰──────────────────────────────╯`)
-        } catch (e) {
-            console.error("❌ Pair code error:", e.message)
-        }
-        isPairingInProgress = false
-    }
-
-    // ── API Mode Info ──
-    if (!sock.authState.creds.registered && selectedLoginMethod === "3") {
-        console.log("╭───〘 🌐 API MODE ACTIVE 〙────────╮")
-        console.log(`│  GET /pair?phone=94758298744     │`)
-        console.log(`│  GET /qr                         │`)
-        console.log(`│  GET /status                     │`)
-        console.log(`╰──────────────────────────────────╯`)
-    }
+    connectionState = "connecting"
+    console.log("🟡 Socket created → connecting to WhatsApp servers...")
 
     // ============================================
     //       CONNECTION UPDATE HANDLER
     // ============================================
-    sock.ev.on("connection.update", (update) => {
+    sock.ev.on("connection.update", async (update) => {
         const { connection, lastDisconnect, qr } = update
 
         // ── QR Ready ──
         if (qr) {
             latestQR = qr
+            connectionState = "connecting"
             if (selectedLoginMethod === "1") {
                 console.log("╭───〘 📱 SCAN QR CODE 〙───╮")
                 qrcode.generate(qr, { small: true })
@@ -255,20 +246,52 @@ async function startBot() {
             }
         }
 
+        // ── Connecting ──
+        if (connection === "connecting") {
+            connectionState = "connecting"
+            console.log("🔄 Connecting to WhatsApp...")
+        }
+
         // ── Connected ──
         if (connection === "open") {
+            connectionState = "open"
             latestQR = null
             sockGlobal = sock
-            isSocketReady = true
             console.log("╭───〘 ✅ BOT CONNECTED 〙───╮")
             console.log(`│ 👤 ${sock.user?.name || "Unknown"}`)
             console.log(`│ 📱 ${sock.user?.id}`)
             console.log("╰──────────────────────────╯")
+
+            // ── Terminal Pair Code After WS Ready ──
+            if (selectedLoginMethod === "2" && !isPairingInProgress && !sock.authState.creds.registered) {
+                isPairingInProgress = true
+                try {
+                    console.log("╭───〘 👑 PAIR CODE SYSTEM 〙───╮")
+                    const phoneNumber = await askQuestion("│ 📱 Enter WhatsApp Number:\n│ Ex: 94758298744\n╰──────────────────────────────╯\n➛ ")
+                    const code = await sock.requestPairingCode(phoneNumber.replace(/[^0-9]/g, ""))
+                    const formattedCode = code?.match(/.{1,4}/g)?.join("-") || code
+                    console.log(`╭───〘 ✅ YOUR PAIR CODE 〙───╮`)
+                    console.log(`│       ${formattedCode}       │`)
+                    console.log(`╰──────────────────────────────╯`)
+                } catch (e) {
+                    console.error("❌ Pair code error:", e.message)
+                }
+                isPairingInProgress = false
+            }
+
+            // ── API Mode Info After Connected ──
+            if (selectedLoginMethod === "3" && !sock.authState.creds.registered) {
+                console.log("╭───〘 🌐 API READY 〙──────────────╮")
+                console.log(`│  GET /pair?phone=94758298744     │`)
+                console.log(`│  GET /qr                         │`)
+                console.log(`│  GET /status                     │`)
+                console.log("╰──────────────────────────────────╯")
+            }
         }
 
         // ── Disconnected ──
         if (connection === "close") {
-            isSocketReady = false
+            connectionState = "close"
             latestQR = null
             isPairingInProgress = false
             const reason = lastDisconnect?.error?.output?.statusCode
@@ -278,8 +301,8 @@ async function startBot() {
                 sockGlobal = null
                 console.log("🚫 Logged Out! Delete session folder and restart.")
             } else {
-                console.log("🔄 Reconnecting in 3s...")
-                setTimeout(() => startBot(), 3000)
+                console.log("🔄 Reconnecting in 5s...")
+                setTimeout(() => startBot(), 5000)
             }
         }
     })
